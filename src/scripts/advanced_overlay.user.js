@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         [placeDE] r/tyles 2026 Extended
 // @namespace    http://tampermonkey.net/
-// @version      1.1
+// @version      1.2
 // @description  Script that adds a button to toggle an hardcoded image shown in the 2026's r/tyles canvas
 // @author       max-was-here and placeDE Devs
 // @match        https://tyles.place/*
@@ -106,6 +106,59 @@ const AO_STYLE = `
     cursor: pointer;
     border-radius: 0;
   }
+  .ao-button.ao-active {
+    background-color: rgb(0, 163, 104);
+    color: #fff;
+  }
+  .ao-button.ao-active:hover {
+    background: linear-gradient(rgba(0, 0, 0, 0.2) 0px, rgba(0, 0, 0, 0.2) 0px), rgb(0, 163, 104);
+  }
+  .ao-monitor-panel {
+    position: absolute;
+    top: 10px;
+    right: 10px;
+    max-height: calc(100vh - 80px);
+    overflow-y: auto;
+    display: none;
+    flex-direction: column;
+    gap: 2px;
+    z-index: 100001;
+    font-family: monospace;
+    font-size: 11px;
+    min-width: 180px;
+  }
+  .ao-monitor-row {
+    position: relative;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 3px 6px;
+    backdrop-filter: blur(4px);
+    background: rgba(0, 0, 0, 0.9);
+    color: #fff;
+    overflow: hidden;
+    cursor: default;
+  }
+  .ao-monitor-bar {
+    position: absolute;
+    top: 0;
+    left: 0;
+    height: 100%;
+    opacity: 0.35;
+    pointer-events: none;
+  }
+  .ao-monitor-name {
+    position: relative;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 140px;
+  }
+  .ao-monitor-pct {
+    position: relative;
+    margin-left: 8px;
+    white-space: nowrap;
+  }
 `;
 
 let toggleSmallPixelButton;
@@ -126,7 +179,9 @@ addEventListener('load', () => {
 
 	let oState = {
 		opacity: 100,
-		overlayIdx: 0
+		overlayIdx: 0,
+		monitorEnabled: false,
+		monitorUrl: 'ws://localhost:9400'
 	};
 
 	const oStateStorage = localStorage.getItem(STORAGE_KEY);
@@ -203,6 +258,328 @@ addEventListener('load', () => {
 
 	new MutationObserver(syncSize).observe(canvas, { attributes: true });
 	new ResizeObserver(syncSize).observe(canvas);
+
+	// ==============================================
+	// Monitor mode (WebSocket outline rendering)
+
+	const monitorCanvas = document.createElement('canvas');
+	monitorCanvas.style.pointerEvents = 'none';
+	monitorCanvas.style.position = 'absolute';
+	monitorCanvas.style.top = '0px';
+	monitorCanvas.style.left = '0px';
+	monitorCanvas.style.zIndex = '101';
+	monitorCanvas.style.display = 'none';
+	overlayContainer.appendChild(monitorCanvas);
+
+	const monitorPanel = document.createElement('div');
+	monitorPanel.classList.add('ao-monitor-panel');
+	mainContainer.appendChild(monitorPanel);
+
+	const updateMonitorPanel = () => {
+		const sorted = [...monitorArtworks.values()].sort((a, b) => a.completion - b.completion);
+		monitorPanel.innerHTML = '';
+		for (const art of sorted) {
+			const hue = art.completion / 100 * 120;
+			const row = document.createElement('div');
+			row.classList.add('ao-monitor-row');
+
+			const bar = document.createElement('div');
+			bar.classList.add('ao-monitor-bar');
+			bar.style.width = art.completion + '%';
+			bar.style.background = `hsl(${hue}, 100%, 45%)`;
+
+			const name = document.createElement('span');
+			name.classList.add('ao-monitor-name');
+			name.textContent = art.name;
+			name.title = art.name;
+
+			let pctText = art.completion.toFixed(1) + '%';
+			if (art.eta_seconds != null && art.eta_seconds > 0) {
+				const mins = Math.floor(art.eta_seconds / 60);
+				const secs = Math.floor(art.eta_seconds % 60);
+				pctText += mins > 0 ? ` (${mins}m${secs}s)` : ` (${secs}s)`;
+			}
+
+			const pct = document.createElement('span');
+			pct.classList.add('ao-monitor-pct');
+			pct.textContent = pctText;
+
+			row.appendChild(bar);
+			row.appendChild(name);
+			row.appendChild(pct);
+			monitorPanel.appendChild(row);
+		}
+	};
+
+	let monitorWs = null;
+	let monitorReconnectTimer = null;
+	const monitorArtworks = new Map();
+	let hoveredArtwork = null;
+	let fadingOutArtwork = null; // stays at full alpha during fade-out
+	let hoverFadeFrom = 0;
+	let hoverFadeTarget = 0;
+	let hoverFadeStart = performance.now();
+	let hoverFadeAnim = null;
+	const FADE_DURATION = 150;
+
+	const getHoverFade = () => {
+		const t = Math.min(1, (performance.now() - hoverFadeStart) / FADE_DURATION);
+		return hoverFadeFrom + (hoverFadeTarget - hoverFadeFrom) * t;
+	};
+
+	const animateHoverFade = () => {
+		drawMonitorOutlines();
+		if (getHoverFade() !== hoverFadeTarget) {
+			hoverFadeAnim = requestAnimationFrame(animateHoverFade);
+		} else {
+			hoverFadeAnim = null;
+			fadingOutArtwork = null;
+		}
+	};
+
+	const setHoverFadeTarget = (target) => {
+		hoverFadeFrom = getHoverFade();
+		hoverFadeTarget = target;
+		hoverFadeStart = performance.now();
+		if (hoverFadeAnim !== null) cancelAnimationFrame(hoverFadeAnim);
+		hoverFadeAnim = requestAnimationFrame(animateHoverFade);
+	};
+
+	const drawMonitorOutlines = () => {
+		const w = canvas.width;
+		const h = canvas.height;
+		if (!w || !h) return;
+
+		const rect = canvas.getBoundingClientRect();
+		const displayScale = rect.width / w;
+		const dpr = window.devicePixelRatio || 1;
+		const maxDim = 4096;
+		const scale = Math.min(displayScale * dpr, maxDim / Math.max(w, h)) * 2;
+
+		const pad = 14; // pixels of padding for labels outside canvas bounds
+		monitorCanvas.width = Math.round((w + pad * 2) * scale);
+		monitorCanvas.height = Math.round((h + pad * 2) * scale);
+		const cssW = parseFloat(canvas.style.width) || w;
+		const cssH = parseFloat(canvas.style.height) || h;
+		const cssPad = pad * (cssW / w);
+		monitorCanvas.style.width = cssW + cssPad * 2 + 'px';
+		monitorCanvas.style.height = cssH + cssPad * 2 + 'px';
+		monitorCanvas.style.left = -cssPad + 'px';
+		monitorCanvas.style.top = -cssPad + 'px';
+
+		const ctx = monitorCanvas.getContext('2d');
+		ctx.scale(scale, scale);
+		ctx.translate(pad, pad);
+
+		const currentFade = getHoverFade();
+		for (const art of monitorArtworks.values()) {
+			const isHovered = hoveredArtwork === art.name;
+			const isKeepVisible = art.name === fadingOutArtwork;
+			const alpha = isHovered || isKeepVisible ? 1 : 1 - currentFade;
+			if (alpha <= 0) continue;
+
+			ctx.globalAlpha = alpha;
+
+			const pct = art.completion;
+			// Color: red (0°) → orange (30°) → green (120°) via HSL
+			const hue = pct / 100 * 120;
+			const color = `hsl(${hue}, 100%, 45%)`;
+
+			ctx.strokeStyle = color;
+			ctx.lineWidth = 1;
+			ctx.strokeRect(art.x - 0.5, art.y - 0.5, art.width + 1, art.height + 1);
+
+			ctx.font = '3px monospace';
+
+			// Percentage badge in top-right corner
+			const pctLabel = pct.toFixed(1) + '%';
+			const pctMetrics = ctx.measureText(pctLabel);
+			const pctH = 4;
+			const pctW = pctMetrics.width + 2;
+			const pctX = art.x + art.width - pctW;
+			const pctY = art.y;
+
+			ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+			ctx.fillRect(pctX, pctY, pctW, pctH);
+			ctx.fillStyle = color;
+			ctx.fillText(pctLabel, pctX + 1, pctY + 3);
+
+			// ETA badge in top-left corner (only if > 30s remaining)
+			if (art.eta_seconds != null && art.eta_seconds > 30) {
+				const mins = Math.floor(art.eta_seconds / 60);
+				const secs = Math.floor(art.eta_seconds % 60);
+				const etaLabel = mins > 0 ? `${mins}m${secs}s` : `${secs}s`;
+				const etaMetrics = ctx.measureText(etaLabel);
+				const etaW = etaMetrics.width + 2;
+				const etaH = 4;
+				const etaX = art.x;
+				const etaY = art.y;
+
+				ctx.fillStyle = 'rgba(0, 0, 0, 0.5)';
+				ctx.fillRect(etaX, etaY, etaW, etaH);
+				ctx.fillStyle = color;
+				ctx.fillText(etaLabel, etaX + 1, etaY + 3);
+			}
+
+			// Name label on hover (above the artwork)
+			if (isHovered) {
+				ctx.font = '10px monospace';
+				const metrics = ctx.measureText(art.name);
+				const labelH = 12;
+				const labelW = metrics.width + 4;
+				const labelX = art.x;
+				const labelY = art.y - labelH;
+
+				ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+				ctx.fillRect(labelX, labelY, labelW, labelH);
+
+				ctx.fillStyle = color;
+				ctx.fillText(art.name, labelX + 2, labelY + 9);
+			}
+		}
+		ctx.globalAlpha = 1;
+	};
+
+	// Hit-test mouse position against artwork bounds
+	document.addEventListener('mousemove', (e) => {
+		if (!oState.monitorEnabled || monitorArtworks.size === 0) return;
+
+		const rect = canvas.getBoundingClientRect();
+		const px = ((e.clientX - rect.left) / rect.width) * canvas.width;
+		const py = ((e.clientY - rect.top) / rect.height) * canvas.height;
+
+		let hit = null;
+		for (const art of monitorArtworks.values()) {
+			if (px >= art.x && px < art.x + art.width && py >= art.y && py < art.y + art.height) {
+				hit = art.name;
+				break;
+			}
+		}
+
+		if (hit !== hoveredArtwork) {
+			const wasHovering = hoveredArtwork !== null;
+			if (wasHovering && !hit) {
+				fadingOutArtwork = hoveredArtwork;
+			}
+			hoveredArtwork = hit;
+			if (!!hit !== wasHovering) {
+				setHoverFadeTarget(hit ? 1 : 0);
+			} else {
+				drawMonitorOutlines();
+			}
+		}
+	});
+
+	// Redraw on canvas size changes and pan/zoom
+	let monitorDrawPending = false;
+	const scheduleMonitorRedraw = () => {
+		if (!oState.monitorEnabled || monitorDrawPending) return;
+		monitorDrawPending = true;
+		requestAnimationFrame(() => {
+			monitorDrawPending = false;
+			drawMonitorOutlines();
+		});
+	};
+
+	new MutationObserver(scheduleMonitorRedraw).observe(canvas, { attributes: true });
+	new ResizeObserver(scheduleMonitorRedraw).observe(canvas);
+	new MutationObserver(scheduleMonitorRedraw).observe(canvasContainer, {
+		attributes: true,
+		attributeFilter: ['style']
+	});
+
+	const monitorConnect = () => {
+		if (monitorWs) {
+			monitorWs.onclose = null;
+			monitorWs.close();
+		}
+		if (monitorReconnectTimer) {
+			clearTimeout(monitorReconnectTimer);
+			monitorReconnectTimer = null;
+		}
+
+		console.log('[PLACEDE] Monitor connecting to', oState.monitorUrl);
+		monitorWs = new WebSocket(oState.monitorUrl);
+
+		monitorWs.onopen = () => {
+			console.log('[PLACEDE] Monitor connected');
+		};
+
+		monitorWs.onmessage = (event) => {
+			let msg;
+			try {
+				msg = JSON.parse(event.data);
+			} catch {
+				return;
+			}
+
+			if (msg.type === 'full') {
+				monitorArtworks.clear();
+				for (const a of msg.artworks) {
+					monitorArtworks.set(a.name, a);
+				}
+			} else if (msg.type === 'update') {
+				for (const a of msg.artworks) {
+					const existing = monitorArtworks.get(a.name);
+					if (existing) {
+						existing.correct_pixels = a.correct_pixels;
+						existing.completion = a.completion;
+						existing.eta_seconds = a.eta_seconds;
+					}
+				}
+			}
+
+			drawMonitorOutlines();
+			updateMonitorPanel();
+		};
+
+		monitorWs.onclose = () => {
+			console.log('[PLACEDE] Monitor disconnected, reconnecting in 3s...');
+			monitorReconnectTimer = setTimeout(monitorConnect, 3000);
+		};
+
+		monitorWs.onerror = (err) => {
+			console.error('[PLACEDE] Monitor error:', err);
+			monitorWs.close();
+		};
+	};
+
+	const monitorDisconnect = () => {
+		if (monitorReconnectTimer) {
+			clearTimeout(monitorReconnectTimer);
+			monitorReconnectTimer = null;
+		}
+		if (monitorWs) {
+			monitorWs.onclose = null;
+			monitorWs.close();
+			monitorWs = null;
+		}
+		monitorArtworks.clear();
+		monitorPanel.innerHTML = '';
+		const ctx = monitorCanvas.getContext('2d');
+		ctx.clearRect(0, 0, monitorCanvas.width, monitorCanvas.height);
+	};
+
+	const toggleMonitor = (button) => {
+		oState.monitorEnabled = !oState.monitorEnabled;
+		monitorCanvas.style.display = oState.monitorEnabled ? 'block' : 'none';
+		monitorPanel.style.display = oState.monitorEnabled ? 'flex' : 'none';
+		button.classList.toggle('ao-active', oState.monitorEnabled);
+
+		if (oState.monitorEnabled) {
+			monitorConnect();
+		} else {
+			monitorDisconnect();
+		}
+		saveState();
+	};
+
+	// Auto-connect if monitor was previously enabled
+	if (oState.monitorEnabled) {
+		monitorCanvas.style.display = 'block';
+		monitorPanel.style.display = 'flex';
+		monitorConnect();
+	}
 
 	// Add style to shadow root
 	const styleContainer = document.createElement('style');
@@ -299,6 +676,21 @@ addEventListener('load', () => {
 		'Screenshot',
 		exportScreenshot
 	);
+
+	const monitorButton = addButton(
+		`
+        <svg width="32px" height="32px" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <rect x="3" y="3" width="18" height="18" rx="2" stroke="currentColor" stroke-width="2"/>
+          <rect x="7" y="7" width="4" height="4" stroke="currentColor" stroke-width="1.5"/>
+          <rect x="13" y="12" width="5" height="6" stroke="currentColor" stroke-width="1.5"/>
+        </svg>
+      `,
+		'Monitor Outlines',
+		function () {
+			toggleMonitor(monitorButton);
+		}
+	);
+	if (oState.monitorEnabled) monitorButton.classList.add('ao-active');
 
 	toggleSmallPixelButton = addButton(
 		`
